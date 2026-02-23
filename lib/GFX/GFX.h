@@ -2,6 +2,7 @@
 #define GFX_H
 
 #include <stdint.h>
+#include <Arduino.h>
 #include "LM215.h"
 
 #define GFX_LINES      3
@@ -16,6 +17,7 @@
 class GFX {
 public:
     static void setText(uint8_t line, const char *str);
+    static void setText(uint8_t line, const __FlashStringHelper *str);
     static void refresh();
 
 private:

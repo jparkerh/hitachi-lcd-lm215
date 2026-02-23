@@ -4,9 +4,9 @@
 
 void setup() {
     LM215::init();
-    GFX::setText(0, "HELLO WORLD!");
-    GFX::setText(1, "LINE TWO HERE");
-    GFX::setText(2, "BOTTOM LINE 3");
+    GFX::setText(0, F("HELLO WORLD!"));
+    GFX::setText(1, F("LINE TWO HERE"));
+    GFX::setText(2, F("BOTTOM LINE 3"));
 }
 
 void loop() {

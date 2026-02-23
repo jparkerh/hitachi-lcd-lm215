@@ -3,6 +3,14 @@
 #include <string.h>
 #include <avr/pgmspace.h>
 
+void GFX::setText(uint8_t line, const __FlashStringHelper *fstr) {
+    // Copy flash string into a temporary RAM buffer then delegate
+    char buf[GFX_COLS + 1];
+    strncpy_P(buf, (const char *)fstr, GFX_COLS);
+    buf[GFX_COLS] = '\0';
+    setText(line, buf);
+}
+
 char GFX::text[GFX_LINES][GFX_COLS + 1] = { "                ",
                                                "                ",
                                                "                " };

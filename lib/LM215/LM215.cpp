@@ -44,20 +44,22 @@ void LM215::refresh() {
 
         // Even pulse: lo nibble
         PORTA = (PORTA & 0xF0) | (byte & 0x0F);  // set D1-D4, preserve M/FLM/CL1/CL2
+        __asm__("nop\n\t");                        // tDS: data setup ~62ns before CL2 rises
         PORTA |= 0x80;                             // CL2 high
-        __asm__("nop\n\tnop\n\tnop\n\t");
+        __asm__("nop\n\tnop\n\tnop\n\t");          // tCH: ~187ns high time
         PORTA &= ~0x80;                            // CL2 low
 
         // Odd pulse: hi nibble
         PORTA = (PORTA & 0xF0) | (byte >> 4);
+        __asm__("nop\n\t");                        // tDS: data setup
         PORTA |= 0x80;                             // CL2 high
-        __asm__("nop\n\tnop\n\tnop\n\t");
+        __asm__("nop\n\tnop\n\tnop\n\t");          // tCH: ~187ns high time
         PORTA &= ~0x80;                            // CL2 low
     }
 
     // --- CL1 latch ---
     PORTA |= 0x40;
-    delayMicroseconds(5);
+    delayMicroseconds(LM215_CL1_US);
     PORTA &= ~0x40;
 
     // --- Clear FLM after row 0 latch ---

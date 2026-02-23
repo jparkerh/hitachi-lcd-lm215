@@ -7,7 +7,8 @@
 #define LM215_WIDTH     480
 #define LM215_HEIGHT    128
 #define LM215_ROWS      64
-#define LM215_ROW_BYTES 120  // 240 CL2 pulses / 2 nibbles per byte
+#define LM215_ROW_BYTES  120  // 240 CL2 pulses / 2 nibbles per byte
+#define LM215_CL1_US    15  // CL1 latch soak time in µs — critical for pixel darkening
 
 // All LCD signals on PORTA (Mega pins 22-29):
 //   PA0=D1  PA1=D2  PA2=D3  PA3=D4
