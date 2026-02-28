@@ -29,7 +29,7 @@
 // 60 pulses / 2 = 30 bytes per row
 // ---------------------------------------------------------------------------
 #define LCD_ROWS      64
-#define LCD_ROW_BYTES 60   // 120 pulses × 4 bits, packed 2 pulses/byte (nibble each)
+#define LCD_ROW_BYTES 120  // 240 pulses × 4 bits, packed 2 pulses/byte (nibble each) = 7680 bytes total, matches Mega
 
 static uint8_t buf[2][LCD_ROWS][LCD_ROW_BYTES];
 static volatile int front = 0;  // core1 always displays buf[front]
@@ -47,9 +47,9 @@ static void core1_main() {
             uint32_t ctrl = m_state ? (1u << PIN_M) : 0u;
             if (row == 0) ctrl |= (1u << PIN_FLM);
 
-            for (int col = 0; col < 120; col++) {
-                // Vertical bars every 10 columns
-                uint32_t data = ((col / 10) % 2) ? 0x0Fu : 0x00u;
+            for (int col = 0; col < 240; col++) {
+                // Vertical bars every 20 columns (matches 10-column bands at full 240-pulse width)
+                uint32_t data = ((col / 20) % 2) ? 0x0Fu : 0x00u;
                 sio_hw->gpio_out = ctrl | data | (1u << PIN_CL2);
                 __asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"
                                "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
