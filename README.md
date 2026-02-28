@@ -1,6 +1,6 @@
-# hitachi-lcd
+# hitachi-lcd-lm215
 
-Firmware for driving a **Hitachi LM215** 480×128 passive LCD from an **Adafruit Feather RP2040** over USB serial. Pairs with the [lm215-designer](https://github.com/jparkerh/lm215-designer) browser-based design tool.
+Firmware for driving a **Hitachi LM215** 480×128 passive LCD from an **Adafruit Feather RP2040** over USB serial. Pairs with the [lcd-web-renderer](https://github.com/jparkerh/lcd-web-renderer) browser-based design tool.
 
 ## Hardware
 
@@ -32,7 +32,7 @@ All pins driven at 12mA. The LM215 is a 5V panel; the 3.3V RP2040 outputs are ge
 
 ## Wire Protocol
 
-Frames are sent from [lm215-designer](https://github.com/jparkerh/lm215-designer) via Web Serial API at 1 Mbaud (USB CDC).
+Frames are sent from [lcd-web-renderer](https://github.com/jparkerh/lcd-web-renderer) via Web Serial API at 1 Mbaud (USB CDC).
 
 ### Display frame
 
@@ -50,7 +50,7 @@ Bits 0–3 of each nibble map to D1–D4 respectively.
 [0xAB] [0xBB]
 ```
 
-Reboots the Feather into BOOTSEL (RPI-RP2 mass storage) mode for flashing — no physical button press required. The lm215-designer **⬆ Flash Mode** button sends this automatically.
+Reboots the Feather into BOOTSEL (RPI-RP2 mass storage) mode for flashing — no physical button press required. The lcd-web-renderer **⬆ Flash Mode** button sends this automatically.
 
 ## Building & Flashing
 
@@ -61,7 +61,7 @@ pio run
 # Flash manually (Feather in BOOTSEL mode)
 cp .pio/build/adafruit_feather_rp2040/firmware.uf2 /path/to/RPI-RP2/
 
-# Or use the Flash Mode button in lm215-designer while connected
+# Or use the Flash Mode button in lcd-web-renderer while connected
 ```
 
 Requires [PlatformIO](https://platformio.org/) and the `maxgerhardt/platform-raspberrypi` platform (installed automatically on first build).
