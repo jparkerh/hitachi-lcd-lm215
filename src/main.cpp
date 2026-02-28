@@ -1,84 +1,93 @@
 #include <Arduino.h>
-#include "LM215.h"
-#include "GFX.h"
+#include "hardware/gpio.h"
+#include "hardware/structs/sio.h"
+#include "pico/multicore.h"
 
 // ---------------------------------------------------------------------------
-// UART → dma_buffer bridge
+// Pin assignments
+// Data (GPIO 0-3): D5, D6, D9, D10 on Feather header → TX, RX, SDA, SCL pads
+// Control (GPIO 7-10): broken out as D5, D6, D9, D10
+// ---------------------------------------------------------------------------
+#define PIN_D1   0   // Serial data: upper-left quadrant
+#define PIN_D2   1   // Serial data: lower-left quadrant
+#define PIN_D3   2   // Serial data: upper-right quadrant
+#define PIN_D4   3   // Serial data: lower-right quadrant
+#define PIN_FLM  7   // Frame start
+#define PIN_M    8   // AC driving signal
+#define PIN_CL1  9   // Data latch (row clock)
+#define PIN_CL2  10  // Shift clock (pixel clock)
+
+// Non-contiguous mask: bits 0-3 and 7-10
+#define LCD_MASK ((0xFu) | (0xFu << 7))
+
+// ---------------------------------------------------------------------------
+// Double buffer
 //
-// Full frame:  0xAB 0xCD [7680 bytes, row-major]
-// Delta frame: 0xAB 0xCE [uint16 count LE] [count × (row uint8, col uint8, val uint8)]
+// Each row = 60 CL2 pulses; packed 2 pulses per byte (low nibble first):
+//   byte bits [3:0] → pulse N   (D1-D4)
+//   byte bits [7:4] → pulse N+1 (D1-D4)
+// 60 pulses / 2 = 30 bytes per row
 // ---------------------------------------------------------------------------
+#define LCD_ROWS      64
+#define LCD_ROW_BYTES 60   // 120 pulses × 4 bits, packed 2 pulses/byte (nibble each)
 
-static uint16_t rx_count  = 0;
-static uint8_t  delta_row = 0;
-static uint8_t  delta_col = 0;
+static uint8_t buf[2][LCD_ROWS][LCD_ROW_BYTES];
+static volatile int front = 0;  // core1 always displays buf[front]
 
-enum RxState : uint8_t {
-    WAIT_MAGIC_0,
-    WAIT_MAGIC_1,
-    RECEIVING_FULL,
-    DELTA_COUNT_LO,
-    DELTA_COUNT_HI,
-    DELTA_ROW,
-    DELTA_COL,
-    DELTA_VAL,
-};
-static RxState rx_state = WAIT_MAGIC_0;
+// ---------------------------------------------------------------------------
+// Core 1 — LCD refresh loop, inline pattern (no buffer, for diagnostics)
+// Mirrors the user's example code exactly, with corrected NOP count.
+// RP2040 @ 125MHz = 8ns/cycle; need ≥150ns → 20 NOPs ≈ 160ns
+// ---------------------------------------------------------------------------
+static void core1_main() {
+    bool m_state = false;
 
-static void uartPump() {
-    while (Serial.available()) {
-        uint8_t b = (uint8_t)Serial.read();
-        switch (rx_state) {
-            case WAIT_MAGIC_0:
-                if (b == 0xAB) rx_state = WAIT_MAGIC_1;
-                break;
-            case WAIT_MAGIC_1:
-                if      (b == 0xCD) { rx_count = 0; rx_state = RECEIVING_FULL; }
-                else if (b == 0xCE) { rx_state = DELTA_COUNT_LO; }
-                else { rx_state = WAIT_MAGIC_0; if (b == 0xAB) rx_state = WAIT_MAGIC_1; }
-                break;
+    while (true) {
+        for (int row = 0; row < LCD_ROWS; row++) {
+            uint32_t ctrl = m_state ? (1u << PIN_M) : 0u;
+            if (row == 0) ctrl |= (1u << PIN_FLM);
 
-            // --- Full frame ---
-            case RECEIVING_FULL:
-                LM215::dma_buffer[rx_count / LM215_ROW_BYTES][rx_count % LM215_ROW_BYTES] = b;
-                if (++rx_count >= (uint16_t)LM215_ROWS * LM215_ROW_BYTES)
-                    rx_state = WAIT_MAGIC_0;
-                break;
+            for (int col = 0; col < 120; col++) {
+                // Vertical bars every 10 columns
+                uint32_t data = ((col / 10) % 2) ? 0x0Fu : 0x00u;
+                sio_hw->gpio_out = ctrl | data | (1u << PIN_CL2);
+                __asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"
+                               "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
+                sio_hw->gpio_out = ctrl | data;
+                __asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"
+                               "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
+            }
 
-            // --- Delta frame ---
-            case DELTA_COUNT_LO:
-                rx_count = b; rx_state = DELTA_COUNT_HI;
-                break;
-            case DELTA_COUNT_HI:
-                rx_count |= ((uint16_t)b << 8);
-                rx_state = (rx_count > 0) ? DELTA_ROW : WAIT_MAGIC_0;
-                break;
-            case DELTA_ROW:
-                delta_row = b; rx_state = DELTA_COL;
-                break;
-            case DELTA_COL:
-                delta_col = b; rx_state = DELTA_VAL;
-                break;
-            case DELTA_VAL:
-                if (delta_row < LM215_ROWS && delta_col < LM215_ROW_BYTES)
-                    LM215::dma_buffer[delta_row][delta_col] = b;
-                rx_state = (--rx_count > 0) ? DELTA_ROW : WAIT_MAGIC_0;
-                break;
+            // CL1 latch — hold 25µs
+            sio_hw->gpio_out = ctrl | (1u << PIN_CL1);
+            delayMicroseconds(25);
+            sio_hw->gpio_out = ctrl;
         }
+
+        m_state = !m_state;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Core 0 helpers
+// ---------------------------------------------------------------------------
+static inline int back_buf()    { return 1 - front; }
+static inline void swap_buffers() { front = 1 - front; }
 
 // ---------------------------------------------------------------------------
 
 void setup() {
-    Serial.begin(115200);
-    LM215::init();
-    GFX::setText(0, F("WAITING..."));
+    const uint8_t pins[] = {0, 1, 2, 3, 7, 8, 9, 10};
+    for (uint8_t pin : pins) {
+        gpio_init(pin);
+        gpio_set_dir(pin, GPIO_OUT);
+        gpio_set_drive_strength(pin, GPIO_DRIVE_STRENGTH_12MA);
+    }
+
+    multicore_launch_core1(core1_main);
 }
 
 void loop() {
-    for (uint8_t i = 0; i < LM215_ROWS; i++) {
-        LM215::refresh();
-    }
-    uartPump(); // pump after full frame to avoid mid-frame tearing
+    // Core 1 owns the LCD; nothing to do on core 0 yet.
+    delay(1000);
 }
