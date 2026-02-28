@@ -34,23 +34,40 @@ All pins driven at 12mA. The LM215 is a 5V panel; the 3.3V RP2040 outputs are ge
 
 Frames are sent from [lcd-web-renderer](https://github.com/jparkerh/lcd-web-renderer) via Web Serial API at 1 Mbaud (USB CDC).
 
-### Display frame
+All communication uses a framed packet format:
 
 ```
-[0xAB] [0xCF] [30720 bytes]
+[AA 55 F0 0F] [TYPE: 1 byte] [LEN: 2 bytes LE] [CRC16: 2 bytes LE] [PAYLOAD: LEN bytes]
 ```
+
+| Field | Size | Description |
+|---|---|---|
+| SOF | 4 bytes | Start-of-frame marker: `AA 55 F0 0F` |
+| TYPE | 1 byte | Packet type (see below) |
+| LEN | 2 bytes LE | Payload length in bytes |
+| CRC16 | 2 bytes LE | CRC-16/CCITT-FALSE over payload (poly `0x1021`, init `0xFFFF`) |
+| PAYLOAD | LEN bytes | Packet-type-specific data |
+
+### Packet types
+
+| TYPE | Name | LEN | Description |
+|---|---|---|---|
+| `0x01` | Display frame | 30720 | Full 4-phase dither frame (see layout below) |
+| `0x02` | Enter bootloader | 0 | Reboots into BOOTSEL — no physical button press required |
+
+### Display frame payload layout
 
 30720 bytes = 4 dither phases × 64 rows × 120 bytes/row.
-Each row: 240 CL2 pulses, nibble-packed 2 per byte (low nibble = even pulse, high nibble = odd pulse).
-Bits 0–3 of each nibble map to D1–D4 respectively.
 
-### Enter bootloader
+Each row is 240 CL2 pulses, nibble-packed 2 per byte:
+- Low nibble = even pulse, high nibble = odd pulse
+- Bits 0–3 of each nibble map to D1–D4 respectively
 
-```
-[0xAB] [0xBB]
-```
+All bytes are XOR'd with `0xFF` for hardware polarity.
 
-Reboots the Feather into BOOTSEL (RPI-RP2 mass storage) mode for flashing — no physical button press required. The lcd-web-renderer **⬆ Flash Mode** button sends this automatically.
+### Resync behaviour
+
+The firmware scans the byte stream for the 4-byte SOF marker. If a packet is interrupted mid-receive (e.g. USB disconnect), a **400 ms timeout** discards the partial packet and returns to SOF scanning — the next valid packet resyncs immediately. Packets with a failing CRC are silently dropped.
 
 ## Building & Flashing
 
