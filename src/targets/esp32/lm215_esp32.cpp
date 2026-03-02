@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "soc/gpio_struct.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -17,17 +18,12 @@
 #define PIN_CL1  22  // Data latch (row clock)
 #define PIN_FLM  23  // Frame start
 
-// ESP32 CPU @ 240MHz → 1 cycle ≈ 4.2ns
-// GPIO.out writes go through APB bus @ 80MHz → ~12.5ns per write
-// LM215 requires CL2 pulse width ≥ 150ns.
-// 40 NOPs × 4.2ns ≈ 167ns — pad each CL2 half-cycle to safely exceed that.
-#define LCD_DELAY() __asm__ __volatile__(        \
-    "nop; nop; nop; nop; nop; nop; nop; nop;\n" \
-    "nop; nop; nop; nop; nop; nop; nop; nop;\n" \
-    "nop; nop; nop; nop; nop; nop; nop; nop;\n" \
-    "nop; nop; nop; nop; nop; nop; nop; nop;\n" \
-    "nop; nop; nop; nop; nop; nop; nop; nop;\n" \
-)
+// CL2 half-cycle delay.
+// ESP32 @ 240MHz / APB @ 80MHz: GPIO write ≈ 12.5ns, NOP ≈ 4.17ns.
+// Target 3MHz → 333ns period → 167ns half-cycle (≥ 150ns minimum).
+// (167 - 12.5) / 4.17 ≈ 37 NOPs → use 40 for margin.
+#define NOP10 __asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n")
+#define LCD_DELAY() do { NOP10; NOP10; NOP10; NOP10; } while(0)
 
 #define CL2_MASK  (1u << PIN_CL2)
 
@@ -52,13 +48,20 @@ void LM215ESP32::begin() {
     for (uint8_t pin : pins) {
         pinMode(pin, OUTPUT);
         digitalWrite(pin, LOW);
+        gpio_set_drive_capability((gpio_num_t)pin, GPIO_DRIVE_CAP_3);  // 40mA max
     }
     memset(buf, 0, sizeof(buf));
+
+    // The LCD task never yields, so the core 0 idle task never runs.
+    // Disable the task watchdog for core 0 to prevent periodic WDT stalls.
+    disableCore0WDT();
+
+    // Pin to core 0 — Arduino loop() runs on core 1 by default.
     xTaskCreatePinnedToCore(
         lcdTaskTrampoline, "lcd",
         4096, this,
         configMAX_PRIORITIES - 1,
-        nullptr, 1
+        nullptr, 0
     );
 }
 
@@ -93,9 +96,9 @@ void LM215ESP32::refreshLoop() {
                 LCD_DELAY();
             }
 
-            // CL1 latch
+            // CL1 latch — 1μs pulse is well above the minimum setup time
             GPIO.out_w1ts = (1u << PIN_CL1);
-            delayMicroseconds(50);
+            delayMicroseconds(1);
             GPIO.out_w1tc = (1u << PIN_CL1);
 
             if (row == 0) GPIO.out_w1tc = (1u << PIN_FLM);

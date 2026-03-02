@@ -10,7 +10,7 @@
 // ---------------------------------------------------------------------------
 #define PACKET_TYPE_FRAME  0x01
 #define PACKET_TYPE_BOOT   0x02
-#define RX_TIMEOUT_MS      400u
+#define RX_TIMEOUT_MS      2000u
 
 // ---------------------------------------------------------------------------
 // CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no bit reflection.
@@ -46,83 +46,90 @@ static LM215Display* display = nullptr;
 
 static inline void rx_reset() { rx_state = WAIT_SOF_0; }
 
+static void processByte(uint8_t b) {
+    switch (rx_state) {
+        case WAIT_SOF_0:
+            if (b == 0xAA) rx_state = WAIT_SOF_1;
+            break;
+        case WAIT_SOF_1:
+            if      (b == 0x55) rx_state = WAIT_SOF_2;
+            else if (b == 0xAA) rx_state = WAIT_SOF_1;
+            else                rx_reset();
+            break;
+        case WAIT_SOF_2:
+            if      (b == 0xF0) rx_state = WAIT_SOF_3;
+            else if (b == 0xAA) rx_state = WAIT_SOF_1;
+            else                rx_reset();
+            break;
+        case WAIT_SOF_3:
+            if      (b == 0x0F) rx_state = WAIT_TYPE;
+            else if (b == 0xAA) rx_state = WAIT_SOF_1;
+            else                rx_reset();
+            break;
+        case WAIT_TYPE:
+            rx_type  = b;
+            rx_state = WAIT_LEN_0;
+            break;
+        case WAIT_LEN_0:
+            rx_len   = b;
+            rx_state = WAIT_LEN_1;
+            break;
+        case WAIT_LEN_1:
+            rx_len |= (uint16_t)b << 8;
+            if (rx_len > LCD_TOTAL_BYTES) { rx_reset(); break; }
+            rx_state = WAIT_CRC_0;
+            break;
+        case WAIT_CRC_0:
+            rx_crc_exp = b;
+            rx_state   = WAIT_CRC_1;
+            break;
+        case WAIT_CRC_1: {
+            rx_crc_exp |= (uint16_t)b << 8;
+            rx_count    = 0;
+            rx_crc_run  = 0xFFFF;
+            rx_start_ms = millis();
+            if (rx_len == 0) {
+                if (rx_crc_run == rx_crc_exp && rx_type == PACKET_TYPE_BOOT)
+                    display->enterBootloader();
+                rx_reset();
+            } else {
+                Serial.printf("HDR type=%02X len=%u crc_exp=%04X\r\n",
+                              rx_type, rx_len, rx_crc_exp);
+                rx_state = RECEIVING;
+            }
+            break;
+        }
+        case RECEIVING: {
+            rx_crc_run = crc16_update(b, rx_crc_run);
+            display->writeByte(rx_count, b);
+            if (++rx_count >= rx_len) {
+                if (rx_crc_run == rx_crc_exp && rx_type == PACKET_TYPE_FRAME) {
+                    display->commitFrame();
+                    Serial.println("FRAME OK");
+                } else {
+                    Serial.printf("FRAME CRC FAIL exp=%04X got=%04X\r\n",
+                                  rx_crc_exp, rx_crc_run);
+                }
+                rx_reset();
+            }
+            break;
+        }
+    }
+}
+
 static void uartPump() {
     if (rx_state == RECEIVING && (millis() - rx_start_ms) > RX_TIMEOUT_MS) {
+        Serial.printf("TIMEOUT at byte %lu\r\n", rx_count);
         rx_reset();
     }
 
-    while (Serial.available()) {
-        const uint8_t b = (uint8_t)Serial.read();
+    int avail = Serial.available();
+    if (!avail) return;
 
-        switch (rx_state) {
-
-            case WAIT_SOF_0:
-                if (b == 0xAA) rx_state = WAIT_SOF_1;
-                break;
-            case WAIT_SOF_1:
-                if      (b == 0x55) rx_state = WAIT_SOF_2;
-                else if (b == 0xAA) rx_state = WAIT_SOF_1;
-                else                rx_reset();
-                break;
-            case WAIT_SOF_2:
-                if      (b == 0xF0) rx_state = WAIT_SOF_3;
-                else if (b == 0xAA) rx_state = WAIT_SOF_1;
-                else                rx_reset();
-                break;
-            case WAIT_SOF_3:
-                if      (b == 0x0F) rx_state = WAIT_TYPE;
-                else if (b == 0xAA) rx_state = WAIT_SOF_1;
-                else                rx_reset();
-                break;
-
-            case WAIT_TYPE:
-                rx_type  = b;
-                rx_state = WAIT_LEN_0;
-                break;
-            case WAIT_LEN_0:
-                rx_len   = b;
-                rx_state = WAIT_LEN_1;
-                break;
-            case WAIT_LEN_1:
-                rx_len |= (uint16_t)b << 8;
-                if (rx_len > LCD_TOTAL_BYTES) { rx_reset(); break; }
-                rx_state = WAIT_CRC_0;
-                break;
-            case WAIT_CRC_0:
-                rx_crc_exp = b;
-                rx_state   = WAIT_CRC_1;
-                break;
-            case WAIT_CRC_1: {
-                rx_crc_exp |= (uint16_t)b << 8;
-                rx_count    = 0;
-                rx_crc_run  = 0xFFFF;
-                rx_start_ms = millis();
-
-                if (rx_len == 0) {
-                    if (rx_crc_run == rx_crc_exp && rx_type == PACKET_TYPE_BOOT) {
-                        display->enterBootloader();
-                    }
-                    rx_reset();
-                } else {
-                    rx_state = RECEIVING;
-                }
-                break;
-            }
-
-            case RECEIVING: {
-                rx_crc_run = crc16_update(b, rx_crc_run);
-                display->writeByte(rx_count, b);
-
-                if (++rx_count >= rx_len) {
-                    if (rx_crc_run == rx_crc_exp && rx_type == PACKET_TYPE_FRAME) {
-                        display->commitFrame();
-                    }
-                    rx_reset();
-                }
-                break;
-            }
-        }
-    }
+    // Read all available bytes in one call — avoids per-byte Arduino overhead.
+    uint8_t chunk[512];
+    const int n = Serial.readBytes(chunk, min(avail, (int)sizeof(chunk)));
+    for (int i = 0; i < n; i++) processByte(chunk[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +137,16 @@ static void uartPump() {
 void setup() {
     display = createDisplay();
     display->begin();
-    Serial.begin(1000000);
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+    // Default UART ring buffer is 256 bytes; a full frame is 30 729 bytes.
+    // Overflow causes byte loss → CRC failure → frame never committed.
+    Serial.setRxBufferSize(32768);
+#endif
+    Serial.begin(921600);
+    // Drain any bytes that arrived during boot/flashing before the state
+    // machine starts — stale bytes would corrupt the SOF search.
+    while (Serial.available()) Serial.read();
+    Serial.println("BOOT");
 }
 
 void loop() {
