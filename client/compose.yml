@@ -1,0 +1,12 @@
+services:
+  clock:
+    build: .
+    network_mode: host
+    env_file: .env
+    volumes:
+      # Share the host's avahi-daemon socket for mDNS (lm215.local) resolution.
+      - /var/run/avahi-daemon/socket:/var/run/avahi-daemon/socket
+      # Use the Pi's local timezone.
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    restart: unless-stopped
