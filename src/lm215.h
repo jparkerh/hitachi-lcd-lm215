@@ -29,8 +29,13 @@ public:
     // Initialise GPIO and launch the refresh loop.
     virtual void begin() = 0;
 
-    // Reboot to bootloader (RP2040) or restart (ESP32, no BOOTSEL equivalent).
+    // Reboot / restart the device.
     virtual void enterBootloader() = 0;
+
+    // Release the refresh loop to run at full priority.
+    // Call at the end of setup() after all hardware/buffer init is done.
+    // Default no-op — task creation and loop launch are decoupled on ESP32.
+    virtual void startRefreshLoop() {}
 
     // Write one payload byte at the given flat offset into the back buffer.
     // Offset maps to [phase][row][col] using the standard LCD_BUF_BYTES layout.

@@ -1,91 +1,111 @@
 # hitachi-lcd-lm215
 
-Firmware for driving a **Hitachi LM215** 480×128 passive LCD from an **Adafruit Feather RP2040** over USB serial. Pairs with the [lcd-web-renderer](https://github.com/jparkerh/lcd-web-renderer) browser-based design tool.
+Firmware for driving a **Hitachi LM215** 480×128 passive LCD from an **ESP32 DevKit V1** over WiFi. Frames are sent via HTTP POST from a Python client on the local network. Includes a live clock, weather, and date display.
 
 ## Hardware
 
 | | |
 |---|---|
 | **Display** | Hitachi LM215 — 480×128, 1-bit passive LCD, 4-quadrant dual-scan |
-| **MCU** | Adafruit Feather RP2040 (RP2040, 133MHz, 264KB SRAM, 8MB Flash) |
+| **MCU** | ESP32 DevKit V1 (Xtensa LX6 dual-core, 240MHz, 520KB SRAM, 4MB Flash) |
+| **Level shifter** | 74HCT245 octal buffer (3.3V → 5V) |
 
 ## Wiring
 
-| LM215 Signal | Function | Feather GPIO | Header Pad |
+ESP32 GPIO pins connect to the LM215 via a 74HCT245 level-shifter. The header runs linearly: GPIO16–GPIO23 → LM215 pins 8→1.
+
+| LM215 Pin | Signal | Function | ESP32 GPIO |
 |---|---|---|---|
-| D1 | Serial data — upper-left quadrant | GPIO 0 | TX |
-| D2 | Serial data — lower-left quadrant | GPIO 1 | RX |
-| D3 | Serial data — upper-right quadrant | GPIO 2 | SDA |
-| D4 | Serial data — lower-right quadrant | GPIO 3 | SCL |
-| FLM | Frame start | GPIO 7 | D5 |
-| M | AC driving signal | GPIO 8 | D6 |
-| CL1 | Data latch (row clock) | GPIO 9 | D9 |
-| CL2 | Shift clock (pixel clock) | GPIO 10 | D10 |
+| 1 | D1 | Serial data — upper-left quadrant | GPIO 23 |
+| 2 | D2 | Serial data — lower-left quadrant | GPIO 22 |
+| 3 | FLM | Frame start | GPIO 21 |
+| 4 | M | AC driving signal | GPIO 19 |
+| 5 | CL1 | Data latch (row clock) | GPIO 18 |
+| 6 | CL2 | Shift clock (pixel clock) | GPIO 5 |
+| 7 | D3 | Serial data — upper-right quadrant | GPIO 17 |
+| 8 | D4 | Serial data — lower-right quadrant | GPIO 16 |
 
-All pins driven at 12mA. The LM215 is a 5V panel; the 3.3V RP2040 outputs are generally sufficient with max drive strength.
+## Architecture
 
-## How it works
+**Core 1** owns the LCD refresh loop at maximum FreeRTOS priority. It cycles through 4 temporal-dither phases continuously, driving 64 rows × 240 CL2 pulses per pass. The full dither cycle runs at ~30Hz, producing four perceived brightness levels through pixel duty cycle.
 
-**Core 1** owns the LCD refresh loop entirely — zero contention with USB. It cycles through 4 temporal-dither phases continuously, driving 64 rows × 240 CL2 pulses per refresh pass. Each phase takes ~8ms; the full 4-phase dither cycle runs at ~30Hz, producing four levels of perceived brightness through pixel on/off duty cycle.
+**Core 0** runs the WiFi stack and HTTP server. When a complete frame arrives via `POST /frame`, it is written into the back buffer and atomically swapped — Core 1 picks it up on the next pass with no tearing.
 
-**Core 0** handles USB serial (CDC) and the UART bridge state machine, writing incoming frames into the back buffer. When a complete frame arrives, it atomically swaps the buffer pointer — Core 1 picks it up on the next pass with no tearing.
+## HTTP API
 
-## Wire Protocol
-
-Frames are sent from [lcd-web-renderer](https://github.com/jparkerh/lcd-web-renderer) via Web Serial API at 1 Mbaud (USB CDC).
-
-All communication uses a framed packet format:
-
-```
-[AA 55 F0 0F] [TYPE: 1 byte] [LEN: 2 bytes LE] [CRC16: 2 bytes LE] [PAYLOAD: LEN bytes]
-```
-
-| Field | Size | Description |
+| Method | Path | Description |
 |---|---|---|
-| SOF | 4 bytes | Start-of-frame marker: `AA 55 F0 0F` |
-| TYPE | 1 byte | Packet type (see below) |
-| LEN | 2 bytes LE | Payload length in bytes |
-| CRC16 | 2 bytes LE | CRC-16/CCITT-FALSE over payload (poly `0x1021`, init `0xFFFF`) |
-| PAYLOAD | LEN bytes | Packet-type-specific data |
+| `POST` | `/frame` | Upload a full frame — 30720 bytes, `application/octet-stream` |
+| `GET` | `/status` | Returns `{"ip":"…","uptime_ms":…,"frames":…}` |
 
-### Packet types
-
-| TYPE | Name | LEN | Description |
-|---|---|---|---|
-| `0x01` | Display frame | 30720 | Full 4-phase dither frame (see layout below) |
-| `0x02` | Enter bootloader | 0 | Reboots into BOOTSEL — no physical button press required |
-
-### Display frame payload layout
+### Frame format
 
 30720 bytes = 4 dither phases × 64 rows × 120 bytes/row.
 
-Each row is 240 CL2 pulses, nibble-packed 2 per byte:
-- Low nibble = even pulse, high nibble = odd pulse
-- Bits 0–3 of each nibble map to D1–D4 respectively
-
-All bytes are XOR'd with `0xFF` for hardware polarity.
-
-### Resync behaviour
-
-The firmware scans the byte stream for the 4-byte SOF marker. If a packet is interrupted mid-receive (e.g. USB disconnect), a **400 ms timeout** discards the partial packet and returns to SOF scanning — the next valid packet resyncs immediately. Packets with a failing CRC are silently dropped.
+Each row is 240 CL2 pulses, nibble-packed 2 per byte (low nibble = even pulse, high nibble = odd). Bits 0–3 map to D1–D4. All bytes are XOR'd with `0xFF` for hardware polarity.
 
 ## Building & Flashing
 
+Requires [PlatformIO](https://platformio.org/). The `espressif32` platform installs automatically on first build.
+
 ```bash
 # Build
-pio run
+~/.platformio/penv/bin/platformio run -e esp32dev
 
-# Flash manually (Feather in BOOTSEL mode)
-cp .pio/build/adafruit_feather_rp2040/firmware.uf2 /path/to/RPI-RP2/
-
-# Or use the Flash Mode button in lcd-web-renderer while connected
+# Flash (CP210x on /dev/ttyUSB0)
+~/.platformio/penv/bin/platformio run -e esp32dev --target upload
 ```
 
-Requires [PlatformIO](https://platformio.org/) and the `maxgerhardt/platform-raspberrypi` platform (installed automatically on first build).
+The device registers on the network as `lm215.local` via mDNS.
 
-## Branches
+## WiFi configuration
 
-| Branch | Description |
-|---|---|
-| `main` | RP2040 / Adafruit Feather — **active** |
-| `legacy-mega` | Original Arduino Mega 2560 implementation (superseded) |
+Copy `src/credentials.h.example` to `src/credentials.h` and fill in your network details:
+
+```cpp
+#define WIFI_SSID     "your-network-name"
+#define WIFI_PASSWORD "your-password"
+```
+
+`src/credentials.h` is gitignored and never committed.
+
+## Python clients
+
+```bash
+pip install -r client/requirements.txt
+```
+
+### Clock / weather (`client/clock.py`)
+
+Displays a live 12-hour clock with AM/PM, current weather, and date across the full 480×128 panel:
+
+- **Left 360px** — H:MM:SS in Moonhouse block font with AM/PM
+- **Top-right 120×64** — weather condition + temperature
+- **Bottom-right 120×64** — day name + date
+
+Weather is provided by [Open-Meteo](https://open-meteo.com/) — free, no API key required.
+
+**Font setup** — Moonhouse is not bundled (freeware, NimaType). Download from [fontspace.com/moonhouse-font-f18420](https://www.fontspace.com/moonhouse-font-f18420), extract the ZIP, and place `Moonhouse.ttf` in `client/fonts/`. The `fonts/` directory is gitignored.
+
+**Configuration** — copy `client/.env.example` to `client/.env` and set your US zip code:
+
+```
+ZIP=10001
+```
+
+**Usage:**
+
+```bash
+python3 client/clock.py                      # lm215.local, zip from .env
+python3 client/clock.py --zip 90210
+python3 client/clock.py --units metric
+python3 client/clock.py --host 192.168.1.42
+```
+
+### Bars test (`client/send_bars.py`)
+
+Sends animated vertical-bar patterns to verify HTTP transport and LCD rendering:
+
+```bash
+python3 client/send_bars.py --host lm215.local
+```

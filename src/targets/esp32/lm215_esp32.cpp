@@ -7,25 +7,38 @@
 #include "../../lm215.h"
 
 // ---------------------------------------------------------------------------
-// Pin assignments — ESP32 DevKit V1 (right-side header)
+// Pin assignments — ESP32 DevKit V1 right-side header, linear order RX2→D23
+// Physical sequence (skipping TX0/RX0/GND): 16,17,5,18,19,21,22,23
+// Wired in order to Hitachi pins 8→1 via 74HCT245 buffer.
 // ---------------------------------------------------------------------------
-#define PIN_D1   16  // Serial data: upper-left quadrant
-#define PIN_D2   17  // Serial data: lower-left quadrant
-#define PIN_D3   18  // Serial data: upper-right quadrant
-#define PIN_D4   19  // Serial data: lower-right quadrant
-#define PIN_M     5  // AC driving signal
-#define PIN_CL2  21  // Shift clock (pixel clock)
-#define PIN_CL1  22  // Data latch (row clock)
-#define PIN_FLM  23  // Frame start
+#define PIN_D4   16  // Hitachi 8 — lower-right data
+#define PIN_D3   17  // Hitachi 7 — upper-right data
+#define PIN_CL2   5  // Hitachi 6 — pixel clock
+#define PIN_CL1  18  // Hitachi 5 — row latch
+#define PIN_M    19  // Hitachi 4 — AC driving signal
+#define PIN_FLM  21  // Hitachi 3 — frame start
+#define PIN_D2   22  // Hitachi 2 — lower-left data
+#define PIN_D1   23  // Hitachi 1 — upper-left data
 
-// CL2 half-cycle delay.
-// ESP32 @ 240MHz / APB @ 80MHz: GPIO write ≈ 12.5ns, NOP ≈ 4.17ns.
-// Target 3MHz → 333ns period → 167ns half-cycle (≥ 150ns minimum).
-// (167 - 12.5) / 4.17 ≈ 37 NOPs → use 40 for margin.
+// CL2 timing.
+// ESP32 @ 240MHz: NOP ≈ 4.17ns.  APB GPIO write ≈ 12.5ns.
+// LCD_DELAY serves double duty: data setup time (before CL2↑) and CL2 high
+// time.  Each is 40 NOPs ≈ 167ns.  Effective CL2 period per nibble:
+//   data_write(12) + setup(167) + CL2↑(12) + high(167) + CL2↓(12) ≈ 370ns
+// → ~2.7 MHz.  At 240 pulses/row × 64 rows × 4 phases ≈ 22ms/cycle → 45 Hz.
 #define NOP10 __asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n")
 #define LCD_DELAY() do { NOP10; NOP10; NOP10; NOP10; } while(0)
 
-#define CL2_MASK  (1u << PIN_CL2)
+#define CL2_MASK  (1u << PIN_CL2)  // GPIO5
+
+// Data pins are non-contiguous: D1=GPIO23, D2=GPIO22, D3=GPIO17, D4=GPIO16.
+// Expand a 4-bit nibble {D4,D3,D2,D1} into the GPIO.out bit positions.
+static inline uint32_t nib(uint8_t n) {
+    return ((uint32_t)(n & 0x1u) << 23)   // D1 bit0 → GPIO23
+         | ((uint32_t)(n & 0x2u) << 21)   // D2 bit1 → GPIO22
+         | ((uint32_t)(n & 0x4u) << 15)   // D3 bit2 → GPIO17
+         | ((uint32_t)(n & 0x8u) << 13);  // D4 bit3 → GPIO16
+}
 
 // ---------------------------------------------------------------------------
 // ESP32 implementation
@@ -33,9 +46,13 @@
 class LM215ESP32 : public LM215Display {
 public:
     void begin() override;
+    void startRefreshLoop() override;
     void enterBootloader() override { esp_restart(); }
 
     void refreshLoop();
+
+private:
+    volatile bool go_ = false;
 };
 
 static void lcdTaskTrampoline(void* arg) {
@@ -52,20 +69,31 @@ void LM215ESP32::begin() {
     }
     memset(buf, 0, sizeof(buf));
 
-    // The LCD task never yields, so the core 0 idle task never runs.
-    // Disable the task watchdog for core 0 to prevent periodic WDT stalls.
-    disableCore0WDT();
-
-    // Pin to core 0 — Arduino loop() runs on core 1 by default.
+    // Create at low priority so setup() on the same core (Core 1) is not
+    // immediately preempted. The task boosts itself to max priority inside
+    // refreshLoop() once startRefreshLoop() signals it is safe to do so.
     xTaskCreatePinnedToCore(
         lcdTaskTrampoline, "lcd",
         4096, this,
-        configMAX_PRIORITIES - 1,
-        nullptr, 0
+        1,          // low — will self-boost after go_ is set
+        nullptr, 1  // Core 1: WiFi owns Core 0
     );
 }
 
+void LM215ESP32::startRefreshLoop() {
+    // Signal the LCD task to leave its wait loop and enter the hot loop.
+    // Called at the end of setup() after all buffers and Serial are ready.
+    go_ = true;
+}
+
 void LM215ESP32::refreshLoop() {
+    // Wait until setup() has finished initialising everything, then self-boost
+    // to max priority and disable Core 1 WDT before entering the hot loop.
+    while (!go_) vTaskDelay(1);
+
+    disableCore1WDT();
+    vTaskPrioritySet(nullptr, configMAX_PRIORITIES - 1);
+
     bool    m_state = false;
     uint8_t phase   = 0;
 
@@ -81,19 +109,22 @@ void LM215ESP32::refreshLoop() {
             for (int col = 0; col < LCD_ROW_BYTES; col++) {
                 const uint8_t byte = rowbuf[col];
 
-                // Even pulse: low nibble
-                uint32_t d = ctrl | ((uint32_t)(byte & 0x0Fu) << 16);
-                GPIO.out = d | CL2_MASK;
-                LCD_DELAY();
-                GPIO.out = d;
-                LCD_DELAY();
+                // Even pulse: low nibble.
+                // Data is written while CL2 is LOW so it is stable before the
+                // rising edge.  CL2 is toggled separately with w1ts/w1tc so
+                // the data pins are never disturbed during the clock pulse.
+                GPIO.out = ctrl | nib(byte & 0x0Fu);
+                LCD_DELAY();                // data setup time
+                GPIO.out_w1ts = CL2_MASK;  // CL2 HIGH — data already stable
+                LCD_DELAY();               // CL2 high time
+                GPIO.out_w1tc = CL2_MASK;  // CL2 LOW
 
-                // Odd pulse: high nibble
-                d = ctrl | ((uint32_t)(byte >> 4) << 16);
-                GPIO.out = d | CL2_MASK;
-                LCD_DELAY();
-                GPIO.out = d;
-                LCD_DELAY();
+                // Odd pulse: high nibble.
+                GPIO.out = ctrl | nib(byte >> 4);
+                LCD_DELAY();                // data setup time
+                GPIO.out_w1ts = CL2_MASK;  // CL2 HIGH
+                LCD_DELAY();               // CL2 high time
+                GPIO.out_w1tc = CL2_MASK;  // CL2 LOW
             }
 
             // CL1 latch — 1μs pulse is well above the minimum setup time

@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../lcd-web-renderer"
+		}
+	],
+	"settings": {}
+}
